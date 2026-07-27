@@ -1,0 +1,20 @@
+[package]
+name = "zephyr_rust_metrics"
+version = "0.2.0"
+edition = "2021"
+description = "Module WASM portable de collecte de metriques, multi-transport (Wi-Fi/BLE)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "zephyr_rust_metrics"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"      # optimiser la taille
+lto = true
+panic = "abort"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+panic = "abort"

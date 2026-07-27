@@ -1,0 +1,17 @@
+[build]
+target = "wasm32-unknown-unknown"
+
+# Flags de l'editeur de liens WebAssembly (wasm-ld) :
+#  - memoire lineaire fixee a 64 Ko (plancher impose par le format WASM et
+#    par wasm-ld ; on ne peut pas descendre en dessous) ;
+#  - pile de 8 Ko ;
+#  - export du point d'entree "main".
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "-C", "link-arg=--initial-memory=65536",
+  "-C", "link-arg=--max-memory=65536",
+  "-C", "link-arg=-zstack-size=8192",
+  "-C", "link-arg=--export=main",
+  "-C", "link-arg=--no-entry",
+  "-C", "link-arg=--allow-undefined",
+]

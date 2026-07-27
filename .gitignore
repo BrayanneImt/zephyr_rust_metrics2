@@ -1,0 +1,5 @@
+/target
+*.wasm
+/.venv
+__pycache__/
+*.pyc
