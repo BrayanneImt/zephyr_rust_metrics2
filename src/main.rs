@@ -31,7 +31,7 @@
 #![cfg_attr(target_arch = "wasm32", no_std)]
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
-#[cfg(all(target_arch = "wasm32", not(test)))]
+#[cfg(target_arch = "wasm32")]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
@@ -139,6 +139,10 @@ extern "C" {
     fn host_metric_stack_usage_pct() -> u32;
     fn host_metric_signal_dbm() -> i32;
     fn host_metric_reset_count() -> u32;
+    // M11 active_threads       : nombre de threads noyau actifs (fuite ?)
+    // M12 tcp_retransmissions  : retransmissions TCP (congestion). 0 en BLE.
+    fn host_metric_active_threads() -> u32;
+    fn host_metric_tcp_retransmissions() -> u32;
 
     // ---- Identite (resolue a l'execution) ---------------------------------
     // Chaque fonction ecrit dans un tampon fourni et retourne le nombre
@@ -153,9 +157,9 @@ extern "C" {
 // BUFFERS STATIQUES — aucune allocation dynamique
 // ============================================================================
 
-const TX_CAP: usize = 512;
+const TX_CAP: usize = 960;
 const RX_CAP: usize = 256;
-const JSON_CAP: usize = 448;
+const JSON_CAP: usize = 768;
 const LOG_CAP: usize = 160;
 const ID_CAP: usize = 32;
 
@@ -173,6 +177,21 @@ static mut OS_BUF: [u8; ID_CAP] = [0u8; ID_CAP];
 static mut OS_LEN: usize = 0;
 static mut TRANSPORT_BUF: [u8; ID_CAP] = [0u8; ID_CAP];
 static mut TRANSPORT_LEN: usize = 0;
+
+// ----------------------------------------------------------------------------
+// COMPTEURS D'ENVOI — servent aux metriques CALCULEES dans le WASM
+//
+// Ces compteurs vivent dans le module (pas dans l'hote) car les grandeurs
+// qu'ils alimentent sont derivees, et tout calcul derive doit se faire ici :
+//   - tx_success_rate      = (envois avec ACK / envois totaux) * 100
+//   - consecutive_failures = nombre d'envois consecutifs sans ACK
+//   - sleep_ratio_pct      = temps endormi / temps total, en %
+// ----------------------------------------------------------------------------
+static mut SEND_TOTAL: u32 = 0;      // nombre total de tentatives d'envoi
+static mut SEND_OK: u32 = 0;         // envois avec ACK recu
+static mut CONSEC_FAILURES: u32 = 0; // echecs consecutifs courants
+static mut LAST_SEND_MS: u32 = 0;    // duree du dernier envoi (ms)
+static mut SLEEP_MS_TOTAL: u32 = 0;  // cumul du temps passe a dormir (ms)
 
 // ============================================================================
 // UTILITAIRES no_std
@@ -330,16 +349,24 @@ fn id_slice(buf: *const u8, len: *const usize) -> &'static [u8] {
 // ============================================================================
 
 struct Metrics {
-    cpu_usage_pct: u32,     // M1  (brut, hote)
-    free_heap_bytes: u32,   // M2  (brut, hote)
-    uptime_ms: u32,         // M3  (brut, hote)
-    bytes_tx: u32,          // M4  (brut, hote)
-    bytes_rx: u32,          // M5  (brut, hote)
-    transport_errors: u32,  // M6  (brut, hote)
-    stack_usage_pct: u32,   // M7  (brut, hote)
-    idle_ratio_pct: u32,    // M8  (CALCULE ici)
-    signal_dbm: i32,        // M9  (brut, hote)
-    reset_count: u32,       // M10 (brut, hote)
+    cpu_usage_pct: u32,        // M1  (brut, hote)
+    free_heap_bytes: u32,      // M2  (brut, hote)
+    uptime_ms: u32,            // M3  (brut, hote)
+    bytes_tx: u32,             // M4  (brut, hote)
+    bytes_rx: u32,             // M5  (brut, hote)
+    transport_errors: u32,     // M6  (brut, hote)
+    stack_usage_pct: u32,      // M7  (brut, hote)
+    idle_ratio_pct: u32,       // M8  (CALCULE ici : 100 - cpu)
+    signal_dbm: i32,           // M9  (brut, hote)
+    reset_count: u32,          // M10 (brut, hote)
+    active_threads: u32,       // M11 (brut, hote)
+    tcp_retransmissions: u32,  // M12 (brut, hote)
+    // Champs CALCULES dans le WASM a partir des compteurs d'envoi :
+    timestamp_ms: u32,         // proxy = uptime_ms (horloge locale du noeud)
+    tx_success_rate: u32,      // (SEND_OK / SEND_TOTAL) * 100
+    last_send_duration_ms: u32,// LAST_SEND_MS
+    consecutive_failures: u32, // CONSEC_FAILURES
+    sleep_ratio_pct: u32,      // SLEEP_MS_TOTAL / uptime_ms * 100
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -347,14 +374,29 @@ fn collect_metrics() -> Metrics {
     unsafe {
         let cpu = host_metric_cpu_usage();
 
-        // M8 est CALCULE ici, pas fourni par l'hote : c'est une operation
-        // derivee, elle doit vivre dans le WASM.
+        // M8 — CALCULE ici (operation derivee).
         let idle = if cpu >= 100 { 0 } else { 100 - cpu };
+
+        let uptime = host_metric_uptime_ms();
+
+        // tx_success_rate — CALCULE ici a partir des compteurs d'envoi.
+        let total = core::ptr::read(&raw const SEND_TOTAL);
+        let ok = core::ptr::read(&raw const SEND_OK);
+        let tx_rate = if total == 0 { 100 } else { (ok * 100) / total };
+
+        // sleep_ratio_pct — CALCULE ici : part du temps passee endormie.
+        let slept = core::ptr::read(&raw const SLEEP_MS_TOTAL);
+        let sleep_pct = if uptime == 0 {
+            0
+        } else {
+            let r = (slept as u64 * 100) / uptime as u64;
+            if r > 100 { 100 } else { r as u32 }
+        };
 
         Metrics {
             cpu_usage_pct: cpu,
             free_heap_bytes: host_metric_free_heap(),
-            uptime_ms: host_metric_uptime_ms(),
+            uptime_ms: uptime,
             bytes_tx: host_metric_bytes_tx(),
             bytes_rx: host_metric_bytes_rx(),
             transport_errors: host_metric_transport_errors(),
@@ -362,12 +404,20 @@ fn collect_metrics() -> Metrics {
             idle_ratio_pct: idle,
             signal_dbm: host_metric_signal_dbm(),
             reset_count: host_metric_reset_count(),
+            active_threads: host_metric_active_threads(),
+            tcp_retransmissions: host_metric_tcp_retransmissions(),
+            timestamp_ms: uptime,
+            tx_success_rate: tx_rate,
+            last_send_duration_ms: core::ptr::read(&raw const LAST_SEND_MS),
+            consecutive_failures: core::ptr::read(&raw const CONSEC_FAILURES),
+            sleep_ratio_pct: sleep_pct,
         }
     }
 }
 
 /// Derive le champ `status` — CALCULE DANS LE WASM.
-/// Priorite : cpu_saturated > heap_low > transport_degraded > stack_risk.
+/// Aligne sur les seuils du serveur (derive_status v2).
+/// Priorite : cpu > heap > link_down > net_degraded > stack.
 fn derive_status(m: &Metrics) -> &'static [u8] {
     if m.cpu_usage_pct > 80 {
         return b"cpu_saturated";
@@ -375,8 +425,11 @@ fn derive_status(m: &Metrics) -> &'static [u8] {
     if m.free_heap_bytes < 4096 {
         return b"heap_low";
     }
-    if m.transport_errors > 3 {
-        return b"transport_degraded";
+    if m.consecutive_failures >= 3 {
+        return b"link_down";
+    }
+    if m.tx_success_rate < 70 {
+        return b"net_degraded";
     }
     if m.stack_usage_pct > 85 {
         return b"stack_overflow_risk";
@@ -440,6 +493,10 @@ fn build_json(m: &Metrics, seq: u32) -> usize {
         i = write_u32(b, i, m.idle_ratio_pct);
         i = write_bytes(b, i, b",");
 
+        i = write_bytes(b, i, b"\"active_threads\":");
+        i = write_u32(b, i, m.active_threads);
+        i = write_bytes(b, i, b",");
+
         i = write_bytes(b, i, b"\"bytes_tx\":");
         i = write_u32(b, i, m.bytes_tx);
         i = write_bytes(b, i, b",");
@@ -448,12 +505,46 @@ fn build_json(m: &Metrics, seq: u32) -> usize {
         i = write_u32(b, i, m.bytes_rx);
         i = write_bytes(b, i, b",");
 
+        // Emis sous les DEUX noms : "transport_errors" (nouveau, generique
+        // wifi/ble) et "net_errors" (compat serveur anterieur). Meme valeur.
         i = write_bytes(b, i, b"\"transport_errors\":");
         i = write_u32(b, i, m.transport_errors);
         i = write_bytes(b, i, b",");
+        i = write_bytes(b, i, b"\"net_errors\":");
+        i = write_u32(b, i, m.transport_errors);
+        i = write_bytes(b, i, b",");
 
+        i = write_bytes(b, i, b"\"tcp_retransmissions\":");
+        i = write_u32(b, i, m.tcp_retransmissions);
+        i = write_bytes(b, i, b",");
+
+        // Emis sous les DEUX noms : "signal_dbm" (nouveau, generique) et
+        // "rssi_dbm" (celui que lit le serveur). Meme valeur.
         i = write_bytes(b, i, b"\"signal_dbm\":");
         i = write_i32(b, i, m.signal_dbm);
+        i = write_bytes(b, i, b",");
+        i = write_bytes(b, i, b"\"rssi_dbm\":");
+        i = write_i32(b, i, m.signal_dbm);
+        i = write_bytes(b, i, b",");
+
+        i = write_bytes(b, i, b"\"timestamp_ms\":");
+        i = write_u32(b, i, m.timestamp_ms);
+        i = write_bytes(b, i, b",");
+
+        i = write_bytes(b, i, b"\"tx_success_rate\":");
+        i = write_u32(b, i, m.tx_success_rate);
+        i = write_bytes(b, i, b",");
+
+        i = write_bytes(b, i, b"\"last_send_duration_ms\":");
+        i = write_u32(b, i, m.last_send_duration_ms);
+        i = write_bytes(b, i, b",");
+
+        i = write_bytes(b, i, b"\"consecutive_failures\":");
+        i = write_u32(b, i, m.consecutive_failures);
+        i = write_bytes(b, i, b",");
+
+        i = write_bytes(b, i, b"\"sleep_ratio_pct\":");
+        i = write_u32(b, i, m.sleep_ratio_pct);
         i = write_bytes(b, i, b",");
 
         i = write_bytes(b, i, b"\"reset_count\":");
@@ -491,6 +582,7 @@ fn send_metrics(handle: i32, seq: u32) {
     log_num(b"  heap_free=", m.free_heap_bytes);
     log_num(b"  stack=", m.stack_usage_pct);
     log_num(b"  tx_err=", m.transport_errors);
+    log_num(b"  tx_ok_rate=", m.tx_success_rate);
 
     let json_len = build_json(&m, seq);
 
@@ -509,22 +601,47 @@ fn send_metrics(handle: i32, seq: u32) {
         j + 1
     };
 
+    // Chronometrage de l'envoi (last_send_duration_ms) via l'horloge hote.
+    let t0 = unsafe { host_metric_uptime_ms() };
+
     let sent = unsafe {
         host_transport_send(handle, (&raw const TX_BUF) as *const u8, tx_len as u32)
     };
 
+    // Comptabilisation de la tentative d'envoi (alimente tx_success_rate,
+    // consecutive_failures : metriques CALCULEES dans le WASM).
+    unsafe {
+        let total = core::ptr::read(&raw const SEND_TOTAL);
+        core::ptr::write(&raw mut SEND_TOTAL, total + 1);
+    }
+
+    let mut got_ack = false;
     if sent > 0 {
         log(b"[METRICS] envoye, attente ACK...\n");
         let received = unsafe {
             host_transport_recv(handle, (&raw mut RX_BUF) as *mut u8, (RX_CAP - 1) as u32)
         };
         if received > 0 {
+            got_ack = true;
             log(b"[METRICS] ACK recu\n");
         } else {
             log(b"[METRICS] pas d'ACK (sans gravite)\n");
         }
     } else {
         log(b"[METRICS] echec d'emission\n");
+    }
+
+    let t1 = unsafe { host_metric_uptime_ms() };
+    unsafe {
+        core::ptr::write(&raw mut LAST_SEND_MS, t1.wrapping_sub(t0));
+        if got_ack {
+            let ok = core::ptr::read(&raw const SEND_OK);
+            core::ptr::write(&raw mut SEND_OK, ok + 1);
+            core::ptr::write(&raw mut CONSEC_FAILURES, 0);
+        } else {
+            let cf = core::ptr::read(&raw const CONSEC_FAILURES);
+            core::ptr::write(&raw mut CONSEC_FAILURES, cf + 1);
+        }
     }
 }
 
@@ -569,7 +686,12 @@ pub extern "C" fn main() {
     loop {
         seq += 1;
         send_metrics(handle, seq);
-        unsafe { host_sleep(SEND_INTERVAL); }
+        unsafe {
+            host_sleep(SEND_INTERVAL);
+            // Cumul du temps endormi -> alimente sleep_ratio_pct (calcule ici).
+            let slept = core::ptr::read(&raw const SLEEP_MS_TOTAL);
+            core::ptr::write(&raw mut SLEEP_MS_TOTAL, slept + SEND_INTERVAL * 1000);
+        }
     }
 }
 

@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
-# Compile le module en WebAssembly et affiche sa taille.
+# Compile le module en WebAssembly (cible wasm32v1-none) et affiche sa taille.
+#
+# On utilise wasm32v1-none (WebAssembly Core 1.0) et NON
+# wasm32-unknown-unknown : cette derniere genere, avec les rustc recents, du
+# WebAssembly avec reference-types que WAMR (mode MVP) refuse de charger.
+# wasm32v1-none produit un binaire strictement 1.0, stdlib comprise, sur Rust
+# stable. Voir .cargo/config.toml pour l'explication complete.
 set -e
 cd "$(dirname "$0")"
 
-rustup target add wasm32-unknown-unknown 2>/dev/null || true
+TARGET=wasm32v1-none
 
-echo "Compilation wasm32-unknown-unknown (release)..."
-cargo build --release --target wasm32-unknown-unknown
+# Ajoute la cible si absente (sans echouer si deja presente ou hors-ligne).
+rustup target add "$TARGET" 2>/dev/null || true
 
-WASM=target/wasm32-unknown-unknown/release/zephyr_rust_metrics.wasm
+echo "Compilation $TARGET (release)..."
+cargo build --release --target "$TARGET"
+
+WASM="target/$TARGET/release/zephyr_rust_metrics.wasm"
 if [ -f "$WASM" ]; then
     SIZE=$(stat -c%s "$WASM" 2>/dev/null || stat -f%z "$WASM")
     echo "OK : $WASM ($SIZE octets)"

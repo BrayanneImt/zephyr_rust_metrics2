@@ -1,13 +1,27 @@
-[build]
-target = "wasm32-unknown-unknown"
+# ============================================================================
+# .cargo/config.toml
+#
+# CIBLE : wasm32v1-none
+# ---------------------
+#
+# La cible "wasm32v1-none" resout cela proprement : elle vise WebAssembly
+# Core 1.0, fonctionne sur Rust STABLE, et fournit core/alloc deja compiles
+# avec uniquement les features minimales. Aucune reference-type, ni dans notre
+# code ni dans la stdlib. (Doc officielle Rust : wasm32v1-none.)
+#
+# Prerequis (une fois) :
+#   rustup target add wasm32v1-none
+# ============================================================================
 
-# Flags de l'editeur de liens WebAssembly (wasm-ld) :
-#  - memoire lineaire fixee a 64 Ko (plancher impose par le format WASM et
-#    par wasm-ld ; on ne peut pas descendre en dessous) ;
-#  - pile de 8 Ko ;
-#  - export du point d'entree "main".
-[target.wasm32-unknown-unknown]
+[build]
+target = "wasm32v1-none"
+
+[target.wasm32v1-none]
 rustflags = [
+  # --- Editeur de liens WebAssembly (wasm-ld) ---
+  #  - memoire lineaire fixee a 64 Ko (plancher du format WASM / wasm-ld) ;
+  #  - pile de 8 Ko ;
+  #  - export du point d'entree "main".
   "-C", "link-arg=--initial-memory=65536",
   "-C", "link-arg=--max-memory=65536",
   "-C", "link-arg=-zstack-size=8192",
