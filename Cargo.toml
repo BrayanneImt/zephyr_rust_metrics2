@@ -1,10 +1,12 @@
 [package]
 name = "zephyr_rust_metrics"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Module WASM portable de collecte de metriques, multi-transport (Wi-Fi/BLE)"
+description = "Module WASM portable de collecte de metriques, multi-transport (Wi-Fi/BLE), decision PADRE + serialisation CBOR"
 license = "Apache-2.0"
 
+# Le binaire reste main.rs ; les modules (config, ffi, log, identity, metrics,
+# cbor, padre, comms) sont declares par `mod` dans main.rs.
 [[bin]]
 name = "zephyr_rust_metrics"
 path = "src/main.rs"
